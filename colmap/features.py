@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
+import torch
 
-from colmap.geometry import calibration_matrix
+from colmap.geometry import DTYPE, calibration_matrix
 from colmap.scene_graph import Camera, ImageNode
 
 
@@ -18,7 +18,7 @@ def default_focal(width: int, height: int) -> float:
     return 1.2 * max(width, height)
 
 
-def extract_sift(image_path: str | Path, max_features: int = 8000) -> tuple[np.ndarray, np.ndarray, int, int]:
+def extract_sift(image_path: str | Path, max_features: int = 8000) -> tuple[torch.Tensor, torch.Tensor, int, int]:
     try:
         import cv2
     except ImportError as exc:
@@ -32,9 +32,14 @@ def extract_sift(image_path: str | Path, max_features: int = 8000) -> tuple[np.n
     sift = cv2.SIFT_create(nfeatures=max_features)
     keypoints, descriptors = sift.detectAndCompute(image, None)
     if not keypoints or descriptors is None:
-        return np.zeros((0, 2)), np.zeros((0, 128), dtype=np.float32), width, height
-    points = np.array([kp.pt for kp in keypoints], dtype=float)
-    return points, descriptors.astype(np.float32), width, height
+        return (
+            torch.zeros((0, 2), dtype=DTYPE),
+            torch.zeros((0, 128), dtype=torch.float32),
+            width,
+            height,
+        )
+    points = torch.tensor([kp.pt for kp in keypoints], dtype=DTYPE)
+    return points, torch.tensor(descriptors, dtype=torch.float32), width, height
 
 
 def load_image_folder(folder: str | Path, focal: float | None = None) -> tuple[dict[int, Camera], dict[int, ImageNode]]:
@@ -53,5 +58,5 @@ def load_image_folder(folder: str | Path, focal: float | None = None) -> tuple[d
     return cameras, images
 
 
-def camera_matrix(camera: Camera) -> np.ndarray:
+def camera_matrix(camera: Camera) -> torch.Tensor:
     return calibration_matrix(camera.focal, camera.width, camera.height)

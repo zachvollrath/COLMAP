@@ -11,17 +11,19 @@ latest consensus is smaller than three.
 
 from __future__ import annotations
 
-import math
-
-import numpy as np
+import torch
 
 from colmap.geometry import (
+    as_tensor,
     camera_center,
     project_points,
     projection_matrix,
     triangulate_dlt,
     triangulation_angle_deg,
 )
+from colmap.device import generator
+from colmap.optimize import levenberg_marquardt
+from colmap.ransac import adaptive_iterations
 from colmap.scene_graph import PANORAMIC, Camera
 
 
@@ -32,15 +34,15 @@ class ViewMeasurement:
         self,
         image_id: int,
         feature_idx: int,
-        xy: np.ndarray,
-        R: np.ndarray,
-        t: np.ndarray,
+        xy: torch.Tensor,
+        R: torch.Tensor,
+        t: torch.Tensor,
         camera: Camera,
         panoramic_with: set[int] | None = None,
     ) -> None:
         self.image_id = image_id
         self.feature_idx = feature_idx
-        self.xy = np.asarray(xy, dtype=float)
+        self.xy = as_tensor(xy).reshape(2)
         self.R = R
         self.t = t
         self.camera = camera
@@ -48,7 +50,7 @@ class ViewMeasurement:
 
 
 def _well_conditioned(
-    point: np.ndarray,
+    point: torch.Tensor,
     first: ViewMeasurement,
     second: ViewMeasurement,
     min_angle_deg: float,
@@ -67,7 +69,7 @@ def _well_conditioned(
     return angle >= min_angle_deg
 
 
-def _reprojection_error(point: np.ndarray, measurement: ViewMeasurement) -> tuple[float, float]:
+def _reprojection_error(point: torch.Tensor, measurement: ViewMeasurement) -> tuple[float, float]:
     uv, depth = project_points(
         point.reshape(1, 3),
         measurement.R,
@@ -77,21 +79,19 @@ def _reprojection_error(point: np.ndarray, measurement: ViewMeasurement) -> tupl
         measurement.camera.height,
         measurement.camera.k1,
     )
-    error = float(np.linalg.norm(uv[0] - measurement.xy))
+    error = float(torch.linalg.norm(uv[0] - measurement.xy))
     return error, float(depth[0])
 
 
-def _refine_point(point: np.ndarray, measurements: list[ViewMeasurement]) -> np.ndarray:
-    """Gauss-Newton refinement of one scene point against its consensus set."""
-    current = point.astype(float).copy()
-    for _ in range(10):
-        jac = np.zeros((2 * len(measurements), 3))
-        res = np.zeros(2 * len(measurements))
-        eps = 1e-6
-        base_pixels = []
-        for index, measurement in enumerate(measurements):
-            uv, _ = project_points(
-                current.reshape(1, 3),
+def _refine_point(point: torch.Tensor, measurements: list[ViewMeasurement]) -> torch.Tensor:
+    """Refine one scene point against its consensus set."""
+    start = as_tensor(point).reshape(3).detach()
+
+    def residual(params: torch.Tensor) -> torch.Tensor:
+        blocks = []
+        for measurement in measurements:
+            uv, depth = project_points(
+                params.reshape(1, 3),
                 measurement.R,
                 measurement.t,
                 measurement.camera.focal,
@@ -99,32 +99,12 @@ def _refine_point(point: np.ndarray, measurements: list[ViewMeasurement]) -> np.
                 measurement.camera.height,
                 measurement.camera.k1,
             )
-            base_pixels.append(uv[0])
-            res[2 * index : 2 * index + 2] = uv[0] - measurement.xy
-        for axis in range(3):
-            shifted = current.copy()
-            shifted[axis] += eps
-            for index, measurement in enumerate(measurements):
-                uv, _ = project_points(
-                    shifted.reshape(1, 3),
-                    measurement.R,
-                    measurement.t,
-                    measurement.camera.focal,
-                    measurement.camera.width,
-                    measurement.camera.height,
-                    measurement.camera.k1,
-                )
-                jac[2 * index : 2 * index + 2, axis] = (uv[0] - base_pixels[index]) / eps
-        try:
-            delta, *_ = np.linalg.lstsq(jac, -res, rcond=None)
-        except np.linalg.LinAlgError:
-            break
-        if not np.all(np.isfinite(delta)):
-            break
-        current = current + delta
-        if float(np.linalg.norm(delta)) < 1e-10:
-            break
-    return current
+            blocks.append(uv[0] - measurement.xy)
+            blocks.append(torch.clamp(-depth, min=0.0))
+        return torch.cat(blocks)
+
+    refined, _ = levenberg_marquardt(start, residual, max_iterations=8, scale=1.0)
+    return refined.detach()
 
 
 def triangulate_track(
@@ -134,12 +114,13 @@ def triangulate_track(
     confidence: float,
     min_inlier_ratio: float,
     min_consensus: int = 3,
-    rng: np.random.Generator | None = None,
-) -> list[tuple[np.ndarray, list[ViewMeasurement]]]:
+    rng: torch.Generator | None = None,
+) -> list[tuple[torch.Tensor, list[ViewMeasurement]]]:
     """Return every well-conditioned point recovered from a track."""
-    rng = rng or np.random.default_rng(0)
+    if rng is None:
+        rng = generator(0)
     remaining = list(measurements)
-    recovered: list[tuple[np.ndarray, list[ViewMeasurement]]] = []
+    recovered: list[tuple[torch.Tensor, list[ViewMeasurement]]] = []
     while len(remaining) >= min_consensus:
         point, consensus = _ransac_consensus(
             remaining,
@@ -172,17 +153,17 @@ def _ransac_consensus(
     max_error_px: float,
     confidence: float,
     min_inlier_ratio: float,
-    rng: np.random.Generator,
-) -> tuple[np.ndarray | None, list[ViewMeasurement] | None]:
+    rng: torch.Generator,
+) -> tuple[torch.Tensor | None, list[ViewMeasurement] | None]:
     n = len(measurements)
     pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
-    rng.shuffle(pairs)
+    order = torch.randperm(len(pairs), generator=rng, device=rng.device).tolist()
+    pairs = [pairs[index] for index in order]
     best_point = None
     best_consensus: list[ViewMeasurement] = []
     inlier_ratio = min(max(min_inlier_ratio, 1e-6), 1.0)
     max_trials = len(pairs)
-    if inlier_ratio < 1.0:
-        max_trials = min(max_trials, math.ceil(math.log(1.0 - confidence) / math.log(1.0 - inlier_ratio**2)))
+    max_trials = min(max_trials, adaptive_iterations(confidence, inlier_ratio, 2, len(pairs)))
     trials = 0
     for i, j in pairs:
         if trials >= max_trials:
@@ -217,13 +198,9 @@ def _ransac_consensus(
             best_consensus = consensus
             best_point = point
             inlier_ratio = max(inlier_ratio, len(consensus) / n)
-            if inlier_ratio < 1.0:
-                max_trials = min(
-                    len(pairs),
-                    math.ceil(math.log(1.0 - confidence) / math.log(1.0 - inlier_ratio**2)),
-                )
-            else:
+            if inlier_ratio >= 1.0:
                 break
+            max_trials = min(len(pairs), adaptive_iterations(confidence, inlier_ratio, 2, len(pairs), trials))
     if best_point is None:
         return None, None
     return best_point, best_consensus
@@ -234,7 +211,7 @@ def two_view_points(
     measurements_b: list[ViewMeasurement],
     min_angle_deg: float,
     max_error_px: float,
-) -> list[tuple[np.ndarray, ViewMeasurement, ViewMeasurement]]:
+) -> list[tuple[torch.Tensor, ViewMeasurement, ViewMeasurement]]:
     """Triangulate a seed pair. Two-view points are the one exception to the
     three-observation consensus required by the recursive estimator.
     """

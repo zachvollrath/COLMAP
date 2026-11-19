@@ -6,6 +6,9 @@ import argparse
 import logging
 from pathlib import Path
 
+import torch
+
+from colmap.device import configure_device
 from colmap.features import load_image_folder
 from colmap.io import write_ply, write_reconstruction
 from colmap.mapper import Mapper
@@ -19,9 +22,20 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--output", type=Path, default=Path("sparse"), help="Directory for the COLMAP text model")
     parser.add_argument("--focal", type=float, default=None, help="Focal length in pixels, shared by every image")
     parser.add_argument("--max-images", type=int, default=None, help="Optional cap used while debugging a subset")
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="PyTorch device. auto uses CUDA when this build can see a GPU.",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    device = configure_device(args.device)
+    if device.type == "cuda":
+        logging.info("Using %s (%s).", device, torch.cuda.get_device_name(device))
+    else:
+        logging.info("Using %s.", device)
     cameras, images = load_image_folder(args.images, focal=args.focal)
     if args.max_images is not None:
         keep = set(sorted(images)[: args.max_images])

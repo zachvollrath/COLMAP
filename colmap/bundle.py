@@ -1,25 +1,27 @@
 """Local and global bundle adjustment, Sections 4.4 and 4.5.
 
 The cost is the Cauchy-robust reprojection error of the simple camera.
-Global problems with a dense viewing graph may collapse unaffected,
-highly overlapping cameras into one rigid group (redundant view mining)
-so the reduced camera system is smaller.
+Parameters are refined with Levenberg-Marquardt; the Jacobian comes from
+PyTorch forward-mode autodiff. Global problems with a dense viewing graph may
+collapse unaffected, highly overlapping cameras into one rigid group.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-import numpy as np
-from scipy.optimize import least_squares
+import torch
 
 from colmap.geometry import (
+    DTYPE,
     angle_axis_to_matrix,
+    as_tensor,
     camera_center,
     matrix_to_angle_axis,
     project_points,
     viewing_direction,
 )
+from colmap.optimize import cauchy, levenberg_marquardt
 from colmap.options import MapperOptions
 
 
@@ -27,8 +29,8 @@ from colmap.options import MapperOptions
 class BAImage:
     image_id: int
     camera_id: int
-    R: np.ndarray
-    t: np.ndarray
+    R: torch.Tensor
+    t: torch.Tensor
     width: int
     height: int
 
@@ -45,21 +47,21 @@ class BACamera:
 class BAObservation:
     image_id: int
     point_id: int
-    xy: np.ndarray
+    xy: torch.Tensor
 
 
 @dataclass
 class BAResult:
-    rotations: dict[int, np.ndarray]
-    translations: dict[int, np.ndarray]
-    points: dict[int, np.ndarray]
+    rotations: dict[int, torch.Tensor]
+    translations: dict[int, torch.Tensor]
+    points: dict[int, torch.Tensor]
     focals: dict[int, float]
     distortions: dict[int, float]
     success: bool
 
 
 def overlap_ratio(visible_a: set[int], visible_b: set[int]) -> float:
-    """Jaccard interaction V_ab of two visibility sets (Eq. 6)."""
+    """Jaccard interaction V_ab of two visibility sets."""
     if not visible_a and not visible_b:
         return 0.0
     intersection = len(visible_a & visible_b)
@@ -115,25 +117,30 @@ def group_redundant_views(
 def _neighbor_pool(
     seed: int,
     remaining: list[int],
-    centers: dict[int, np.ndarray],
-    directions: dict[int, np.ndarray],
+    centers: dict[int, torch.Tensor],
+    directions: dict[int, torch.Tensor],
     neighbor_count: int,
     max_angle_deg: float,
 ) -> list[int]:
     seed_dir = directions[seed]
-    cosine_limit = np.cos(np.radians(max_angle_deg))
+    cosine_limit = float(torch.cos(torch.deg2rad(torch.tensor(max_angle_deg))))
     ranked = []
     for candidate in remaining:
         direction = directions[candidate]
-        if float(np.dot(seed_dir, direction)) < cosine_limit:
+        if float(torch.dot(seed_dir, direction)) < cosine_limit:
             continue
-        distance = float(np.linalg.norm(centers[candidate] - centers[seed]))
+        distance = float(torch.linalg.norm(centers[candidate] - centers[seed]))
         ranked.append((distance, candidate))
     ranked.sort()
     return [candidate for _, candidate in ranked[:neighbor_count]]
 
 
-def _compose_group_pose(R_c: np.ndarray, t_c: np.ndarray, R_g: np.ndarray, t_g: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _compose_group_pose(
+    R_c: torch.Tensor,
+    t_c: torch.Tensor,
+    R_g: torch.Tensor,
+    t_g: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """P_cr = P_c G_r, with both poses stored as world-to-camera rigid transforms."""
     R = R_c @ R_g
     t = R_c @ t_g + t_c
@@ -143,7 +150,7 @@ def _compose_group_pose(R_c: np.ndarray, t_c: np.ndarray, R_g: np.ndarray, t_g: 
 def bundle_adjust(
     images: list[BAImage],
     cameras: list[BACamera],
-    points: dict[int, np.ndarray],
+    points: dict[int, torch.Tensor],
     observations: list[BAObservation],
     options: MapperOptions,
     groups: list[list[int]] | None = None,
@@ -152,7 +159,7 @@ def bundle_adjust(
     anchor_image: int | None = None,
     fixed_images: set[int] | None = None,
 ) -> BAResult:
-    """Minimize Eq. 1, or Eq. 7 when `groups` collapses redundant cameras.
+    """Minimize the reprojection cost, or the grouped cost when cameras share a rigid motion.
 
     `anchor_image` is held fixed and the baseline to the next image is pinned,
     which removes the similarity gauge. Additional `fixed_images` keep their
@@ -168,7 +175,7 @@ def bundle_adjust(
     fixed.add(anchor)
     scale_partner = next(image_id for image_id in order if image_id != anchor)
     baseline = float(
-        np.linalg.norm(
+        torch.linalg.norm(
             camera_center(by_id[anchor].R, by_id[anchor].t)
             - camera_center(by_id[scale_partner].R, by_id[scale_partner].t)
         )
@@ -183,12 +190,9 @@ def bundle_adjust(
             group_of[image_id] = index
     free_groups = []
     for index, group in enumerate(groups):
-        members = group
-        if any(member in fixed for member in members):
+        if any(member in fixed for member in group):
             continue
         free_groups.append(index)
-    # The baseline partner has to be either fixed or free. If every camera
-    # except the anchor was fixed, pose refinement would be a no-op.
     if not free_groups:
         return _identity_result(images, cameras, points, False)
     group_param_index = {group_index: slot for slot, group_index in enumerate(free_groups)}
@@ -207,48 +211,48 @@ def bundle_adjust(
 
     n_group = 6 * len(free_groups)
     n_intr = 2 * len(intrinsic_ids)
-    n_pts = 3 * len(point_ids)
-    x0 = np.zeros(n_group + n_intr + n_pts)
+    x0 = torch.zeros(n_group + n_intr + 3 * len(point_ids), dtype=DTYPE)
+    fixed_pose = {}
+    for image_id, image in by_id.items():
+        fixed_pose[image_id] = (as_tensor(image.R).detach(), as_tensor(image.t).detach())
     for group_index, slot in group_param_index.items():
-        # G starts at the identity, so the current member poses are unchanged.
-        # Singleton groups store the member pose directly instead of G.
         members = groups[group_index]
         if len(members) == 1:
             image = by_id[members[0]]
             x0[6 * slot : 6 * slot + 3] = matrix_to_angle_axis(image.R)
-            x0[6 * slot + 3 : 6 * slot + 6] = image.t
+            x0[6 * slot + 3 : 6 * slot + 6] = as_tensor(image.t)
     for slot, camera_id in enumerate(intrinsic_ids):
         camera = camera_by_id[camera_id]
         base = n_group + 2 * slot
-        x0[base] = np.log(max(camera.focal, 1e-6))
+        x0[base] = torch.log(torch.tensor(max(camera.focal, 1e-6), dtype=DTYPE))
         x0[base + 1] = camera.k1 if options.refine_extra_params else 0.0
+    point_offset = n_group + n_intr
     for slot, point_id in enumerate(point_ids):
-        x0[n_group + n_intr + 3 * slot : n_group + n_intr + 3 * slot + 3] = points[point_id]
+        x0[point_offset + 3 * slot : point_offset + 3 * slot + 3] = as_tensor(points[point_id])
 
-    grouped_obs: list[tuple[int, np.ndarray, np.ndarray]] = []
-    pending: dict[int, list[tuple[int, np.ndarray]]] = {}
+    grouped_obs: list[tuple[int, torch.Tensor, torch.Tensor]] = []
+    pending: dict[int, list[tuple[int, torch.Tensor]]] = {}
     for obs in observations:
         if obs.image_id not in by_id or obs.point_id not in point_index:
             continue
-        pending.setdefault(obs.image_id, []).append((point_index[obs.point_id], obs.xy))
+        pending.setdefault(obs.image_id, []).append((point_index[obs.point_id], as_tensor(obs.xy)))
     for image_id, entries in pending.items():
         grouped_obs.append(
             (
                 image_id,
-                np.asarray([entry[0] for entry in entries], dtype=int),
-                np.asarray([entry[1] for entry in entries], dtype=float),
+                torch.tensor([entry[0] for entry in entries], dtype=torch.long),
+                torch.stack([entry[1] for entry in entries]),
             )
         )
-    n_residuals = sum(len(xy) for _, _, xy in grouped_obs)
-    if n_residuals < 4:
+    if sum(len(xy) for _, _, xy in grouped_obs) < 4:
         return _identity_result(images, cameras, points, False)
 
-    def unpack(params: np.ndarray):
+    def unpack(params: torch.Tensor):
         poses = {}
         for image_id, image in by_id.items():
             group_index = group_of[image_id]
             if group_index not in group_param_index:
-                poses[image_id] = (image.R, image.t)
+                poses[image_id] = fixed_pose[image_id]
                 continue
             slot = group_param_index[group_index]
             aa = params[6 * slot : 6 * slot + 3]
@@ -257,26 +261,20 @@ def bundle_adjust(
             if len(groups[group_index]) == 1:
                 poses[image_id] = (R_var, vec)
             else:
-                poses[image_id] = _compose_group_pose(image.R, image.t, R_var, vec)
-        focals = {}
-        distortions = {}
-        for camera_id, camera in camera_by_id.items():
-            focals[camera_id] = camera.focal
-            distortions[camera_id] = camera.k1
+                R_c, t_c = fixed_pose[image_id]
+                poses[image_id] = _compose_group_pose(R_c, t_c, R_var, vec)
+        focals = {camera_id: camera.focal for camera_id, camera in camera_by_id.items()}
+        distortions = {camera_id: camera.k1 for camera_id, camera in camera_by_id.items()}
         for slot, camera_id in enumerate(intrinsic_ids):
             base = n_group + 2 * slot
-            focals[camera_id] = float(np.exp(params[base]))
-            distortions[camera_id] = float(params[base + 1]) if options.refine_extra_params else camera_by_id[camera_id].k1
-        pts = {}
-        for slot, point_id in enumerate(point_ids):
-            pts[point_id] = params[n_group + n_intr + 3 * slot : n_group + n_intr + 3 * slot + 3]
-        return poses, focals, distortions, pts
-
-    point_offset = n_group + n_intr
-
-    def residuals(params: np.ndarray) -> np.ndarray:
-        poses, focals, distortions, _ = unpack(params)
+            focals[camera_id] = torch.exp(params[base])
+            if options.refine_extra_params:
+                distortions[camera_id] = params[base + 1]
         point_matrix = params[point_offset:].reshape(-1, 3)
+        return poses, focals, distortions, point_matrix
+
+    def residuals(params: torch.Tensor) -> torch.Tensor:
+        poses, focals, distortions, point_matrix = unpack(params)
         blocks = []
         for image_id, indices, xy in grouped_obs:
             R, t = poses[image_id]
@@ -293,36 +291,202 @@ def bundle_adjust(
             blocks.append((uv - xy).reshape(-1))
         center_a = camera_center(*poses[anchor])
         center_b = camera_center(*poses[scale_partner])
-        blocks.append(np.array([50.0 * (np.linalg.norm(center_a - center_b) - baseline)]))
-        return np.concatenate(blocks)
+        blocks.append(50.0 * (torch.linalg.norm(center_a - center_b) - baseline).reshape(1))
+        return torch.cat(blocks)
 
-    result = least_squares(
+    refined_cam, refined_points, success = _adjust_partitioned(
+        x0[:point_offset].detach(),
+        x0[point_offset:].detach().reshape(-1, 3),
         residuals,
-        x0,
-        method="trf",
-        loss="cauchy",
-        f_scale=max(options.ba_loss_scale_px, 1e-6),
-        max_nfev=max(max_iterations, 1) * max(int(x0.size), 1),
-        ftol=1e-5,
-        xtol=1e-5,
-        gtol=1e-5,
+        unpack,
+        grouped_obs,
+        by_id,
+        max_iterations,
+        options.ba_loss_scale_px,
     )
-    poses, focals, distortions, pts = unpack(result.x)
+    refined = torch.cat([refined_cam, refined_points.reshape(-1)])
+    poses, focals, distortions, point_matrix = unpack(refined)
+    point_matrix = point_matrix.detach()
     return BAResult(
-        rotations={image_id: pose[0] for image_id, pose in poses.items()},
-        translations={image_id: pose[1] for image_id, pose in poses.items()},
-        points=pts,
-        focals=focals,
-        distortions=distortions,
-        success=bool(result.success),
+        rotations={image_id: pose[0].detach() for image_id, pose in poses.items()},
+        translations={image_id: pose[1].detach() for image_id, pose in poses.items()},
+        points={point_id: point_matrix[slot].clone() for slot, point_id in enumerate(point_ids)},
+        focals={camera_id: float(value) for camera_id, value in focals.items()},
+        distortions={camera_id: float(value) for camera_id, value in distortions.items()},
+        success=success,
     )
 
 
-def _identity_result(images: list[BAImage], cameras: list[BACamera], points: dict[int, np.ndarray], success: bool) -> BAResult:
+def _adjust_partitioned(
+    cameras0: torch.Tensor,
+    points0: torch.Tensor,
+    residuals,
+    unpack,
+    grouped_obs: list[tuple[int, torch.Tensor, torch.Tensor]],
+    by_id: dict[int, BAImage],
+    max_iterations: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """Alternate a camera step with an independent point step.
+
+    The joint normal matrix is dense in the points, so one Levenberg-Marquardt
+    step on every parameter does not scale past a few hundred tracks. Cameras
+    (and intrinsics) stay a small dense block. Each point then has its own 3x3
+    system, which is the point half of the Schur complement.
+    """
+    cameras = cameras0.clone()
+    points = points0.clone()
+    accepted = False
+    camera_ok = False
+
+    def total_cost(cam: torch.Tensor, xyz: torch.Tensor) -> float:
+        return float(cauchy(residuals(torch.cat([cam, xyz.reshape(-1)])), scale).detach())
+
+    cost = total_cost(cameras, points)
+    for _ in range(max(max_iterations, 1)):
+        def camera_residuals(cam: torch.Tensor, fixed_points: torch.Tensor = points) -> torch.Tensor:
+            return residuals(torch.cat([cam, fixed_points.reshape(-1)]))
+
+        cameras, camera_ok = levenberg_marquardt(cameras, camera_residuals, max_iterations=1, scale=scale)
+        cameras = cameras.detach()
+        poses, focals, distortions, _ = unpack(torch.cat([cameras, points.reshape(-1)]))
+        poses = {image_id: (rotation.detach(), translation.detach()) for image_id, (rotation, translation) in poses.items()}
+        focals = {camera_id: value.detach() if isinstance(value, torch.Tensor) else value for camera_id, value in focals.items()}
+        distortions = {
+            camera_id: value.detach() if isinstance(value, torch.Tensor) else value
+            for camera_id, value in distortions.items()
+        }
+        points = _refine_points(points, poses, focals, distortions, grouped_obs, by_id, scale)
+        updated = total_cost(cameras, points)
+        if updated < cost:
+            accepted = True
+            if cost - updated < 1e-8:
+                break
+            cost = updated
+            continue
+        break
+    return cameras, points, accepted or camera_ok
+
+
+def _refine_points(
+    points: torch.Tensor,
+    poses: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    focals: dict[int, torch.Tensor | float],
+    distortions: dict[int, torch.Tensor | float],
+    grouped_obs: list[tuple[int, torch.Tensor, torch.Tensor]],
+    by_id: dict[int, BAImage],
+    scale: float,
+) -> torch.Tensor:
+    """One damped step per point. Points do not couple once the cameras are fixed."""
+    hessian, gradient = _point_normal(points, poses, focals, distortions, grouped_obs, by_id, scale)
+    damping = torch.full((len(points),), 1e-3, dtype=DTYPE)
+    eye = torch.eye(3, dtype=DTYPE)
+    base_cost = _point_costs(points, poses, focals, distortions, grouped_obs, by_id, scale)
+    updated = points.clone()
+    pending = torch.ones(len(points), dtype=torch.bool)
+    for _attempt in range(8):
+        diagonal = hessian.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8)
+        system = hessian + damping[:, None, None] * torch.diag_embed(diagonal) + 1e-10 * eye
+        step = torch.linalg.solve(system, -gradient)
+        candidate = points + step
+        cost = _point_costs(candidate, poses, focals, distortions, grouped_obs, by_id, scale)
+        improved = pending & (cost < base_cost)
+        updated = torch.where(improved[:, None], candidate, updated)
+        pending = pending & ~improved
+        if not bool(pending.any()):
+            break
+        damping = torch.where(pending, damping * 4.0, damping)
+    return updated.detach()
+
+
+def _point_costs(points, poses, focals, distortions, grouped_obs, by_id, scale: float) -> torch.Tensor:
+    cost = torch.zeros(len(points), dtype=DTYPE)
+    safe_scale = max(float(scale), 1e-6)
+    for image_id, indices, xy in grouped_obs:
+        rotation, translation = poses[image_id]
+        image = by_id[image_id]
+        uv, _ = project_points(
+            points[indices],
+            rotation,
+            translation,
+            focals[image.camera_id],
+            image.width,
+            image.height,
+            distortions[image.camera_id],
+        )
+        residual = uv - xy
+        cost.index_add_(0, indices, torch.log1p((residual / safe_scale) ** 2).sum(dim=1))
+    return cost
+
+
+def _point_normal(points, poses, focals, distortions, grouped_obs, by_id, scale: float):
+    hessian = torch.zeros((len(points), 3, 3), dtype=DTYPE)
+    gradient = torch.zeros((len(points), 3), dtype=DTYPE)
+    safe_scale = max(float(scale), 1e-6)
+    for image_id, indices, xy in grouped_obs:
+        rotation, translation = poses[image_id]
+        image = by_id[image_id]
+        uv, jacobian = _reprojection_jacobian_wrt_point(
+            points[indices],
+            rotation,
+            translation,
+            focals[image.camera_id],
+            image.width,
+            image.height,
+            distortions[image.camera_id],
+        )
+        residual = uv - xy
+        weight = 1.0 / (1.0 + (residual / safe_scale) ** 2)
+        weighted = jacobian * weight[:, :, None]
+        hessian.index_add_(0, indices, torch.einsum("nri,nrj->nij", weighted, jacobian))
+        gradient.index_add_(0, indices, torch.einsum("nri,nr->ni", jacobian, weight * residual))
+    return hessian, gradient
+
+
+def _reprojection_jacobian_wrt_point(points, rotation, translation, focal, width, height, k1):
+    """Pixels and d(pixel)/d(world point) for the simple radial camera."""
+    points = as_tensor(points)
+    rotation = as_tensor(rotation)
+    translation = as_tensor(translation).reshape(3)
+    focal_t = as_tensor(focal).reshape(())
+    k1_t = as_tensor(k1).reshape(())
+    camera = points @ rotation.transpose(0, 1) + translation
+    depth = camera[:, 2]
+    z = torch.where(depth.abs() < 1e-12, torch.full_like(depth, 1e-12), depth)
+    x = camera[:, 0] / z
+    y = camera[:, 1] / z
+    radius2 = x * x + y * y
+    radial = 1.0 + k1_t * radius2
+    du_dx = focal_t * (radial + 2.0 * k1_t * x * x)
+    du_dy = focal_t * (2.0 * k1_t * x * y)
+    dv_dy = focal_t * (radial + 2.0 * k1_t * y * y)
+    inv_z = 1.0 / z
+    du_d_camera = torch.stack(
+        [du_dx * inv_z, du_dy * inv_z, -(du_dx * x + du_dy * y) * inv_z],
+        dim=1,
+    )
+    dv_d_camera = torch.stack(
+        [du_dy * inv_z, dv_dy * inv_z, -(du_dy * x + dv_dy * y) * inv_z],
+        dim=1,
+    )
+    jacobian_camera = torch.stack([du_d_camera, dv_d_camera], dim=1)
+    jacobian = torch.matmul(jacobian_camera, rotation)
+    pixels = torch.column_stack(
+        [focal_t * (x * radial) + width / 2.0, focal_t * (y * radial) + height / 2.0]
+    )
+    return pixels, jacobian
+
+
+def _identity_result(
+    images: list[BAImage],
+    cameras: list[BACamera],
+    points: dict[int, torch.Tensor],
+    success: bool,
+) -> BAResult:
     return BAResult(
-        rotations={image.image_id: image.R.copy() for image in images},
-        translations={image.image_id: image.t.copy() for image in images},
-        points={point_id: xyz.copy() for point_id, xyz in points.items()},
+        rotations={image.image_id: as_tensor(image.R).clone() for image in images},
+        translations={image.image_id: as_tensor(image.t).clone() for image in images},
+        points={point_id: as_tensor(xyz).clone() for point_id, xyz in points.items()},
         focals={camera.camera_id: camera.focal for camera in cameras},
         distortions={camera.camera_id: camera.k1 for camera in cameras},
         success=success,

@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-import numpy as np
+import torch
 
 from colmap.bundle import (
     BACamera,
@@ -22,7 +22,10 @@ from colmap.bundle import (
     bundle_adjust,
     group_redundant_views,
 )
+from colmap.device import generator
 from colmap.geometry import (
+    DTYPE,
+    as_tensor,
     camera_center,
     dlt_pnp,
     pixels_to_normalized,
@@ -52,9 +55,9 @@ class Observation:
 
 @dataclass
 class Point3D:
-    xyz: np.ndarray
+    xyz: torch.Tensor
     observations: list[Observation] = field(default_factory=list)
-    color: np.ndarray = field(default_factory=lambda: np.array([200, 200, 200], dtype=np.uint8))
+    color: torch.Tensor = field(default_factory=lambda: torch.tensor([200, 200, 200], dtype=torch.uint8))
     error: float = 0.0
 
 
@@ -62,7 +65,7 @@ class Point3D:
 class Reconstruction:
     cameras: dict[int, Camera]
     images: dict[int, ImageNode]
-    poses: dict[int, tuple[np.ndarray, np.ndarray]]
+    poses: dict[int, tuple[torch.Tensor, torch.Tensor]]
     points: dict[int, Point3D]
     registration_order: list[int]
 
@@ -78,15 +81,15 @@ class Reconstruction:
         if not self.points:
             return 0.0
         errors = [point.error for point in self.points.values()]
-        return float(np.mean(errors))
+        return float(torch.tensor(errors, dtype=DTYPE).mean())
 
 
 class Mapper:
     def __init__(self, graph: SceneGraph, options: MapperOptions | None = None) -> None:
         self.graph = graph
         self.options = options or MapperOptions()
-        self.rng = np.random.default_rng(self.options.random_seed)
-        self.poses: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self.rng = generator(int(self.options.random_seed))
+        self.poses: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.points: dict[int, Point3D] = {}
         self.registration_order: list[int] = []
         self._next_point_id = 1
@@ -104,12 +107,12 @@ class Mapper:
     def reconstruct(self) -> Reconstruction | None:
         self._build_tracks()
         self._panoramic = panoramic_pairs(self.graph.pairs)
-        seed = self._select_seed()
-        if seed is None:
+        seeds = self._select_seeds()
+        if not seeds:
             logger.warning("No suitable initial pair.")
             return None
-        if not self._initialize(seed):
-            logger.warning("Initial pair could not be triangulated.")
+        if not any(self._try_initialize(seed) for seed in seeds):
+            logger.warning("Reconstruction failed: no initial pair produced a model.")
             return None
         self._local_bundle(self.registration_order[-1])
         self._filter_observations()
@@ -138,7 +141,7 @@ class Mapper:
         return Reconstruction(
             cameras=self.graph.cameras,
             images=self.graph.images,
-            poses={image_id: (R.copy(), t.copy()) for image_id, (R, t) in self.poses.items()},
+            poses={image_id: (R.clone(), t.clone()) for image_id, (R, t) in self.poses.items()},
             points=self.points,
             registration_order=list(self.registration_order),
         )
@@ -195,7 +198,8 @@ class Mapper:
                 self._feature_to_track[(image_id, feature_idx)] = next_id
             next_id += 1
 
-    def _select_seed(self):
+    def _select_seeds(self):
+        """Seed candidates, best first. A failed triangulation tries the next pair."""
         calibrated = []
         fallback = []
         for pair in self.graph.pairs:
@@ -203,34 +207,47 @@ class Mapper:
                 continue
             if pair.num_inliers < self.options.init_min_num_inliers:
                 continue
-            if pair.median_angle_deg < self.options.init_min_tri_angle_deg:
+            if pair.median_angle_deg <= 0.0:
                 continue
             if pair.calibrated:
                 calibrated.append(pair)
             else:
                 fallback.append(pair)
         pool = calibrated if self.options.prefer_calibrated_seed and calibrated else calibrated + fallback
-        best = None
-        best_score = -1.0
-        for pair in pool:
+        # A wide baseline is preferred, but a facade can be a perfectly valid
+        # seed whose median angle is below the 16° target. Dropping every such
+        # pair leaves the reconstruction with nothing to grow from.
+        wide = [pair for pair in pool if pair.median_angle_deg >= self.options.init_min_tri_angle_deg]
+        chosen = wide if wide else pool
+
+        def score(pair) -> float:
             shared = self.graph.neighbors(pair.image_id1) & self.graph.neighbors(pair.image_id2)
-            score = pair.num_inliers * (1 + len(shared)) * pair.median_angle_deg
-            if score > best_score:
-                best_score = score
-                best = pair
-        if best is not None:
-            logger.info(
-                "Initial pair (%s, %s) with %d inliers, median angle %.1f deg.",
-                best.image_id1,
-                best.image_id2,
-                best.num_inliers,
-                best.median_angle_deg,
-            )
-        return best
+            return pair.num_inliers * (1 + len(shared)) * pair.median_angle_deg
+
+        return sorted(chosen, key=score, reverse=True)
+
+    def _try_initialize(self, pair) -> bool:
+        self.poses.clear()
+        self.points.clear()
+        self.registration_order.clear()
+        self._next_point_id = 1
+        self._track_points.clear()
+        self._obs_to_point.clear()
+        logger.info(
+            "Initial pair (%s, %s) with %d inliers, median angle %.1f deg.",
+            pair.image_id1,
+            pair.image_id2,
+            pair.num_inliers,
+            pair.median_angle_deg,
+        )
+        if self._initialize(pair):
+            return True
+        logger.warning("Seed triangulation produced no model for pair (%s, %s).", pair.image_id1, pair.image_id2)
+        return False
 
     def _initialize(self, pair) -> bool:
-        self.poses[pair.image_id1] = (np.eye(3), np.zeros(3))
-        self.poses[pair.image_id2] = (pair.R.copy(), pair.t.copy())
+        self.poses[pair.image_id1] = (torch.eye(3, dtype=DTYPE), torch.zeros(3, dtype=DTYPE))
+        self.poses[pair.image_id2] = (pair.R.clone(), pair.t.clone())
         self.registration_order.extend([pair.image_id1, pair.image_id2])
         left = []
         right = []
@@ -244,7 +261,7 @@ class Mapper:
         created = two_view_points(
             left,
             right,
-            self.options.init_min_tri_angle_deg,
+            self.options.tri_min_angle_deg,
             self.options.tri_max_error_px,
         )
         for xyz, first, second in created:
@@ -270,7 +287,7 @@ class Mapper:
             self._panoramic.get(image_id, set()),
         )
 
-    def _add_point(self, xyz: np.ndarray, observations: list[tuple[int, int]]) -> int | None:
+    def _add_point(self, xyz: torch.Tensor, observations: list[tuple[int, int]]) -> int | None:
         unique = []
         seen_images = set()
         for image_id, feature_idx in observations:
@@ -283,7 +300,7 @@ class Mapper:
             return None
         point_id = self._next_point_id
         self._next_point_id += 1
-        point = Point3D(xyz=np.asarray(xyz, dtype=float).copy(), observations=unique)
+        point = Point3D(xyz=as_tensor(xyz).clone(), observations=unique)
         self.points[point_id] = point
         for obs in unique:
             self._obs_to_point[(obs.image_id, obs.feature_idx)] = point_id
@@ -301,16 +318,8 @@ class Mapper:
                 continue
             camera = self.graph.cameras[image.camera_id]
             score = NextBestViewScore(self.options.next_view_levels, camera.width, camera.height)
-            seen_points: set[int] = set()
-            for feature_idx in range(len(image.keypoints)):
-                track_id = self._feature_to_track.get((image_id, feature_idx))
-                if track_id is None:
-                    continue
-                point_ids = [pid for pid in self._track_points.get(track_id, []) if pid in self.points]
-                if not point_ids or point_ids[0] in seen_points:
-                    continue
-                seen_points.add(point_ids[0])
-                xy = image.keypoints[feature_idx]
+            _, pixels, _, _ = self._correspondences(image_id)
+            for xy in pixels:
                 score.add(float(xy[0]), float(xy[1]))
             self._scores[image_id] = score
 
@@ -330,21 +339,20 @@ class Mapper:
         camera = self.graph.cameras[image.camera_id]
         normalized = pixels_to_normalized(pixels, camera.focal, camera.width, camera.height, camera.k1)
 
-        def fit(sample: np.ndarray):
+        def fit(sample: torch.Tensor):
             pose = dlt_pnp(world[sample], normalized[sample])
             if pose is None:
                 return None
             _, depth = project_points(world[sample], pose[0], pose[1], camera.focal, camera.width, camera.height, camera.k1)
-            if int(np.count_nonzero(depth > 0)) < 4:
+            if int((depth > 0).sum()) < 4:
                 return None
             return pose
 
-        def residual(model: object) -> np.ndarray:
+        def residual(model: object) -> torch.Tensor:
             R, t = model  # type: ignore[misc]
             uv, depth = project_points(world, R, t, camera.focal, camera.width, camera.height, camera.k1)
-            error = np.linalg.norm(uv - pixels, axis=1)
-            error = np.where(depth > 0, error, 1e6)
-            return error
+            error = torch.linalg.norm(uv - pixels, dim=1)
+            return torch.where(depth > 0, error, torch.full_like(error, 1e6))
 
         model, inliers = ransac(
             len(world),
@@ -359,7 +367,7 @@ class Mapper:
         )
         if model is None or inliers is None:
             return False
-        count = int(np.count_nonzero(inliers))
+        count = int(inliers.sum().item())
         if count < minimum or count / len(world) < self.options.abs_pose_min_inlier_ratio:
             return False
         R, t = refine_pose(
@@ -373,17 +381,17 @@ class Mapper:
             camera.k1,
         )
         uv, depth = project_points(world, R, t, camera.focal, camera.width, camera.height, camera.k1)
-        error = np.linalg.norm(uv - pixels, axis=1)
+        error = torch.linalg.norm(uv - pixels, dim=1)
         refined_inliers = (depth > 0) & (error <= self.options.abs_pose_max_error_px)
-        if int(np.count_nonzero(refined_inliers)) < minimum:
+        if int(refined_inliers.sum().item()) < minimum:
             return False
-        self.poses[image_id] = (R, t)
+        self.poses[image_id] = (R.detach(), t.detach())
         self.registration_order.append(image_id)
-        for keep, feature_idx, point_id in zip(refined_inliers, feature_indices, point_ids):
+        for keep, feature_idx, point_id in zip(refined_inliers.tolist(), feature_indices.tolist(), point_ids.tolist()):
             if not keep:
                 continue
-            self._attach_observation(point_id, image_id, int(feature_idx))
-        logger.info("Registered image %s (%d inliers).", image_id, int(np.count_nonzero(refined_inliers)))
+            self._attach_observation(int(point_id), image_id, int(feature_idx))
+        logger.info("Registered image %s (%d inliers).", image_id, int(refined_inliers.sum().item()))
         return True
 
     def _correspondences(self, image_id: int):
@@ -393,30 +401,53 @@ class Mapper:
         features = []
         point_ids = []
         used_points = set()
-        for feature_idx, xy in enumerate(image.keypoints):
+        used_features = set()
+
+        def consider(feature_idx: int, point_id: int) -> None:
+            if point_id not in self.points or point_id in used_points or feature_idx in used_features:
+                return
+            if any(obs.image_id == image_id for obs in self.points[point_id].observations):
+                return
+            if feature_idx < 0 or feature_idx >= len(image.keypoints):
+                return
+            used_points.add(point_id)
+            used_features.add(feature_idx)
+            world.append(self.points[point_id].xyz)
+            pixels.append(image.keypoints[feature_idx])
+            features.append(feature_idx)
+            point_ids.append(point_id)
+
+        for feature_idx in range(len(image.keypoints)):
             track_id = self._feature_to_track.get((image_id, feature_idx))
             if track_id is None:
                 continue
             candidates = [pid for pid in self._track_points.get(track_id, []) if pid in self.points]
-            if not candidates:
+            if candidates:
+                consider(feature_idx, candidates[0])
+
+        # A conflicting earlier match can keep a verified correspondence out of the
+        # track. The inlier itself still identifies the 3D point in a registered image.
+        for pair in self.graph.pairs:
+            if pair.image_id1 == image_id and pair.image_id2 in self.poses:
+                feature_col, other_col, other_image = 0, 1, pair.image_id2
+            elif pair.image_id2 == image_id and pair.image_id1 in self.poses:
+                feature_col, other_col, other_image = 1, 0, pair.image_id1
+            else:
                 continue
-            point_id = candidates[0]
-            if point_id in used_points:
-                continue
-            if any(obs.image_id == image_id for obs in self.points[point_id].observations):
-                continue
-            used_points.add(point_id)
-            world.append(self.points[point_id].xyz)
-            pixels.append(xy)
-            features.append(feature_idx)
-            point_ids.append(point_id)
+            for row in pair.matches:
+                point_id = self._obs_to_point.get((other_image, int(row[other_col])))
+                if point_id is None:
+                    continue
+                consider(int(row[feature_col]), point_id)
+
         if not world:
-            return np.zeros((0, 3)), np.zeros((0, 2)), np.zeros(0, dtype=int), np.zeros(0, dtype=int)
+            empty = torch.zeros(0, dtype=torch.long)
+            return torch.zeros((0, 3), dtype=DTYPE), torch.zeros((0, 2), dtype=DTYPE), empty, empty
         return (
-            np.asarray(world, dtype=float),
-            np.asarray(pixels, dtype=float),
-            np.asarray(features, dtype=int),
-            np.asarray(point_ids, dtype=int),
+            torch.stack([as_tensor(point) for point in world]),
+            torch.stack([as_tensor(pixel) for pixel in pixels]),
+            torch.tensor(features, dtype=torch.long),
+            torch.tensor(point_ids, dtype=torch.long),
         )
 
     def _attach_observation(self, point_id: int, image_id: int, feature_idx: int) -> bool:
@@ -477,7 +508,7 @@ class Mapper:
                     )
                     if float(depth[0]) <= 0:
                         continue
-                    error = float(np.linalg.norm(uv[0] - measurement.xy))
+                    error = float(torch.linalg.norm(uv[0] - measurement.xy))
                     if error <= best_error:
                         best_error = error
                         best_id = point_id
@@ -556,7 +587,7 @@ class Mapper:
             )
             if float(depth[0]) <= 0:
                 return False
-            if float(np.linalg.norm(uv[0] - measurement.xy)) > self.options.filter_max_reproj_error_px:
+            if float(torch.linalg.norm(uv[0] - measurement.xy)) > self.options.filter_max_reproj_error_px:
                 return False
         return True
 
@@ -697,7 +728,7 @@ class Mapper:
                         camera.height,
                         camera.k1,
                     )
-                    error = float(np.linalg.norm(uv[0] - image.keypoints[obs.feature_idx]))
+                    error = float(torch.linalg.norm(uv[0] - image.keypoints[obs.feature_idx]))
                     if float(depth[0]) <= 0 or error > self.options.group_affected_error_px:
                         bad += 1
             visibility[image_id] = point_ids
@@ -727,7 +758,7 @@ class Mapper:
         for camera_id in camera_ids:
             camera = self.graph.cameras[camera_id]
             cameras.append(BACamera(camera_id, camera.focal, camera.k1, camera.prior_focal))
-        xyz = {point_id: self.points[point_id].xyz.copy() for point_id in point_ids}
+        xyz = {point_id: self.points[point_id].xyz.clone() for point_id in point_ids}
         observations = []
         active_points = set(point_ids)
         active_images = set(image_ids)
@@ -736,7 +767,7 @@ class Mapper:
                 if obs.image_id not in active_images:
                     continue
                 xy = self.graph.images[obs.image_id].keypoints[obs.feature_idx]
-                observations.append(BAObservation(obs.image_id, point_id, np.asarray(xy, dtype=float)))
+                observations.append(BAObservation(obs.image_id, point_id, as_tensor(xy)))
         if anchor not in active_images:
             anchor = image_ids[0]
         result = bundle_adjust(
@@ -781,7 +812,7 @@ class Mapper:
                     measurement.camera.height,
                     measurement.camera.k1,
                 )
-                error = float(np.linalg.norm(uv[0] - measurement.xy))
+                error = float(torch.linalg.norm(uv[0] - measurement.xy))
                 if float(depth[0]) <= 0 or error > self.options.filter_max_reproj_error_px:
                     removed += 1
                     self._obs_to_point.pop((obs.image_id, obs.feature_idx), None)
@@ -846,5 +877,5 @@ class Mapper:
                     measurement.camera.height,
                     measurement.camera.k1,
                 )
-                errors.append(float(np.linalg.norm(uv[0] - measurement.xy)))
-            point.error = float(np.mean(errors)) if errors else 0.0
+                errors.append(float(torch.linalg.norm(uv[0] - measurement.xy)))
+            point.error = float(torch.tensor(errors, dtype=DTYPE).mean()) if errors else 0.0

@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
-import numpy as np
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from colmap.device import configure_device
 from colmap.geometry import camera_center, umeyama
 from colmap.io import write_ply, write_reconstruction
 from colmap.mapper import Mapper
@@ -19,7 +21,11 @@ from colmap.scene_graph import build_scene_graph
 from tests.synthetic import correspondences, make_scene
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Reconstruct the synthetic scene.")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    args = parser.parse_args(argv)
+    configure_device(args.device)
     world, cameras, images, true_poses = make_scene()
     matches = correspondences(images, min_matches=15)
     graph = build_scene_graph(
@@ -47,13 +53,15 @@ def main() -> None:
         rotation, translation = reconstruction.poses[image_id]
         estimated.append(camera_center(rotation, translation))
         truth.append(true_poses[image_id][2])
-    scale, rotation, translation = umeyama(np.asarray(estimated), np.asarray(truth))
-    aligned = scale * (np.asarray(estimated) @ rotation.T) + translation
-    error = np.linalg.norm(aligned - np.asarray(truth), axis=1)
+    estimated_centers = torch.stack(estimated)
+    truth_centers = torch.stack(truth)
+    scale, rotation, translation = umeyama(estimated_centers, truth_centers)
+    aligned = scale * (estimated_centers @ rotation.T) + translation
+    error = torch.linalg.norm(aligned - truth_centers, dim=1)
     print(
         f"registered {reconstruction.num_images} images, {reconstruction.num_points} points, "
         f"mean reprojection {reconstruction.mean_reprojection_error():.3f} px, "
-        f"median camera error {np.median(error):.4f}"
+        f"median camera error {error.median().item():.4f}"
     )
     print(f"wrote {output}")
 

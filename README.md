@@ -24,7 +24,7 @@ matching, then multi-model geometric verification.
 | Next best view | Ranks unregistered images with the multi-resolution occupancy score (`L` levels, `K_l = 2^l`, weight `K_l^2`). |
 | Registration | RANSAC Perspective-n-Point against already triangulated points, then nonlinear pose refinement. |
 | Triangulation | Recursive unique-sample RANSAC on feature tracks. Panoramic pairs are not triangulated. A consensus smaller than three ends the recursion. |
-| Bundle adjustment | Cauchy reprojection loss on a simple camera (one focal length, one radial coefficient, principal point fixed at the image center). Local BA runs after every registration. Global BA runs when the model has grown by the configured ratio, with re-triangulation and filtering before and after, iterated until those updates shrink. |
+| Bundle adjustment | Cauchy reprojection loss on a simple camera (one focal length, one radial coefficient, principal point fixed at the image center). Levenberg-Marquardt uses PyTorch forward-mode Jacobians. Local BA runs after every registration. Global BA runs when the model has grown by the configured ratio, with re-triangulation and filtering before and after, iterated until those updates shrink. |
 | Redundant view mining | Unaffected cameras whose visibility sets have Jaccard overlap above `V` are collapsed into one rigid group for global BA. |
 
 The paper leaves several thresholds symbolic. Defaults match the numbers given
@@ -37,15 +37,20 @@ and essential inlier ratios `0.8`, initialization angle `16°`).
 ```bash
 python -m venv .venv
 source .venv/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .
 pip install opencv-python-headless   # only needed to run on image files
 ```
 
+Install a CUDA wheel from [pytorch.org](https://pytorch.org/get-started/locally/) instead of the CPU wheel when reconstructions should run on a GPU.
+
 Reconstruct a folder of photographs:
 
 ```bash
-colmap-sfm /path/to/images --output sparse
+colmap-sfm /path/to/images --output sparse --device auto
 ```
+
+`--device` is `auto`, `cpu`, or `cuda`. `auto` uses CUDA when the installed PyTorch can see a GPU, and CPU otherwise.
 
 `--focal` sets a shared focal length in pixels. Without it, each image uses the
 prior `1.2 * max(width, height)`. The text model in `sparse/` uses COLMAP's

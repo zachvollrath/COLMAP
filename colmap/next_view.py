@@ -9,8 +9,6 @@ points are scarce.
 
 from __future__ import annotations
 
-import numpy as np
-
 
 class NextBestViewScore:
     def __init__(self, levels: int, width: int, height: int) -> None:

@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
+import torch
 
-from colmap.geometry import matrix_to_quaternion
+from colmap.geometry import DTYPE, matrix_to_quaternion
 from colmap.mapper import Reconstruction
+
+
+def _num(value) -> str:
+    return f"{float(value):.16g}"
 
 
 def write_reconstruction(reconstruction: Reconstruction, output_dir: str | Path) -> None:
@@ -25,7 +29,7 @@ def _write_cameras(reconstruction: Reconstruction, path: Path) -> None:
         camera = reconstruction.cameras[camera_id]
         lines.append(
             f"{camera_id} SIMPLE_RADIAL {camera.width} {camera.height} "
-            f"{camera.focal} {camera.cx} {camera.cy} {camera.k1}"
+            f"{_num(camera.focal)} {_num(camera.cx)} {_num(camera.cy)} {_num(camera.k1)}"
         )
     path.write_text("\n".join(lines) + "\n")
 
@@ -45,12 +49,13 @@ def _write_images(reconstruction: Reconstruction, path: Path) -> None:
         image = reconstruction.images[image_id]
         qw, qx, qy, qz = matrix_to_quaternion(R)
         lines.append(
-            f"{image_id} {qw} {qx} {qy} {qz} {t[0]} {t[1]} {t[2]} {image.camera_id} {image.name}"
+            f"{image_id} {_num(qw)} {_num(qx)} {_num(qy)} {_num(qz)} "
+            f"{_num(t[0])} {_num(t[1])} {_num(t[2])} {image.camera_id} {image.name}"
         )
         parts = []
         for feature_idx, xy in enumerate(image.keypoints):
             point_id = feature_point.get((image_id, feature_idx), -1)
-            parts.append(f"{xy[0]} {xy[1]} {point_id}")
+            parts.append(f"{_num(xy[0])} {_num(xy[1])} {point_id}")
         lines.append(" ".join(parts))
     path.write_text("\n".join(lines) + "\n")
 
@@ -64,7 +69,7 @@ def _write_points(reconstruction: Reconstruction, path: Path) -> None:
         r, g, b = (int(c) for c in point.color)
         track = " ".join(f"{obs.image_id} {obs.feature_idx}" for obs in point.observations)
         x, y, z = point.xyz
-        lines.append(f"{point_id} {x} {y} {z} {r} {g} {b} {point.error} {track}")
+        lines.append(f"{point_id} {_num(x)} {_num(y)} {_num(z)} {r} {g} {b} {_num(point.error)} {track}")
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -81,15 +86,17 @@ def write_ply(reconstruction: Reconstruction, path: str | Path) -> None:
     for point in points:
         x, y, z = point.xyz
         r, g, b = (int(c) for c in point.color)
-        body.append(f"{x} {y} {z} {r} {g} {b}")
+        body.append(f"{_num(x)} {_num(y)} {_num(z)} {r} {g} {b}")
     Path(path).write_text(header + "\n".join(body) + "\n")
 
 
-def camera_centers(reconstruction: Reconstruction) -> np.ndarray:
+def camera_centers(reconstruction: Reconstruction) -> torch.Tensor:
     from colmap.geometry import camera_center
 
     centers = []
     for image_id in reconstruction.registration_order:
         R, t = reconstruction.poses[image_id]
         centers.append(camera_center(R, t))
-    return np.asarray(centers, dtype=float)
+    if not centers:
+        return torch.zeros((0, 3), dtype=DTYPE)
+    return torch.stack(centers)
